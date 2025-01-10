@@ -44,7 +44,12 @@ resource "aws_apigatewayv2_integration" "api_sample" {
 resource "aws_apigatewayv2_route" "api_sample" {
   api_id    = aws_apigatewayv2_api.lambda.id
   route_key = "GET /hello"
-  target    = "integrations/${aws_apigatewayv2_integration.api_sample.id}"
+  # jwt authorizerを設定
+  authorizer_id      = aws_apigatewayv2_authorizer.jwt.id
+  authorization_type = "JWT"
+  # Cognitoでスコープを設定する場合はここで設定
+  authorization_scopes = ["http://localhost:3000/basic"]
+  target               = "integrations/${aws_apigatewayv2_integration.api_sample.id}"
 }
 
 resource "aws_lambda_permission" "apigw" {
@@ -53,6 +58,18 @@ resource "aws_lambda_permission" "apigw" {
   function_name = aws_lambda_function.hello_world.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.lambda.execution_arn}/*/*"
+}
+
+### JWT Authorizer
+resource "aws_apigatewayv2_authorizer" "jwt" {
+  api_id           = aws_apigatewayv2_api.lambda.id
+  name             = "jwt-authorizer"
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.PreAuthorization"]
+  jwt_configuration {
+    audience = [aws_cognito_user_pool_client.user_pool_client.id]
+    issuer   = "https://${aws_cognito_user_pool.user_pool.endpoint}"
+  }
 }
 
 ## Lambda
