@@ -1,6 +1,5 @@
 ## API Gateway HTTP API
-
-resource "aws_apigatewayv2_api" "lambda" {
+resource "aws_apigatewayv2_api" "main" {
   name          = "${var.prefix}-api"
   protocol_type = "HTTP"
 }
@@ -10,7 +9,7 @@ resource "aws_cloudwatch_log_group" "gateway" {
 }
 
 resource "aws_apigatewayv2_stage" "lambda" {
-  api_id = aws_apigatewayv2_api.lambda.id
+  api_id = aws_apigatewayv2_api.main.id
   # stageが必要ならちゃんと設定しよう
   name        = "$default"
   auto_deploy = true
@@ -33,36 +32,42 @@ resource "aws_apigatewayv2_stage" "lambda" {
   }
 }
 
-resource "aws_apigatewayv2_integration" "api_sample" {
-  api_id = aws_apigatewayv2_api.lambda.id
+# API Gateway を VPC Link で ALB に接続する
+# JWT認証が通ったリクエストをALBに転送する
 
-  integration_uri    = aws_lambda_function.hello_world.invoke_arn
-  integration_type   = "AWS_PROXY"
-  integration_method = "POST"
+resource "aws_apigatewayv2_vpc_link" "main" {
+  name               = "${var.prefix}-vpc-link"
+  security_group_ids = [aws_security_group.vpc_link.id]
+  subnet_ids         = [aws_subnet.example1.id, aws_subnet.example2.id]
 }
 
-resource "aws_apigatewayv2_route" "api_sample" {
-  api_id    = aws_apigatewayv2_api.lambda.id
-  route_key = "GET /hello"
-  # jwt authorizerを設定
-  authorizer_id      = aws_apigatewayv2_authorizer.jwt.id
-  authorization_type = "JWT"
-  # Cognitoでスコープを設定する場合はここで設定
-  authorization_scopes = ["http://localhost:3000/basic"]
-  target               = "integrations/${aws_apigatewayv2_integration.api_sample.id}"
+# ALB にアクセスできる Security Group を作成
+resource "aws_security_group" "vpc_link" {
+  name   = "${var.prefix}-vpc-link-sg"
+  vpc_id = aws_vpc.example.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 }
 
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.hello_world.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.lambda.execution_arn}/*/*"
+
+resource "aws_apigatewayv2_integration" "alb_integration" {
+  api_id = aws_apigatewayv2_api.main.id
+
+  integration_type   = "HTTP_PROXY"
+  integration_uri    = aws_lb_listener.internal.arn
+  integration_method = "ANY"
+  connection_type    = "VPC_LINK"
+  connection_id      = aws_apigatewayv2_vpc_link.main.id
 }
 
 ### JWT Authorizer
 resource "aws_apigatewayv2_authorizer" "jwt" {
-  api_id           = aws_apigatewayv2_api.lambda.id
+  api_id           = aws_apigatewayv2_api.main.id
   name             = "jwt-authorizer"
   authorizer_type  = "JWT"
   identity_sources = ["$request.header.PreAuthorization"]
@@ -72,37 +77,79 @@ resource "aws_apigatewayv2_authorizer" "jwt" {
   }
 }
 
-## Lambda
-data "aws_iam_policy_document" "lambda_assume_role" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
+# API Gateway → VPC Link → Internal NLB → External ALB へのルーティング
+resource "aws_apigatewayv2_route" "api_sample" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "ANY /{proxy+}"
+  # jwt authorizerを設定
+  authorizer_id      = aws_apigatewayv2_authorizer.jwt.id
+  authorization_type = "JWT"
+  # Cognitoでスコープを設定する場合はここで設定
+  authorization_scopes = ["http://localhost:3000/basic"]
+  target               = "integrations/${aws_apigatewayv2_integration.alb_integration.id}"
+}
+
+## Internal NLB
+resource "aws_lb" "internal" {
+  name               = "${var.prefix}-internal-nlb"
+  internal           = true
+  load_balancer_type = "network"
+  security_groups    = [aws_security_group.nlb-internal.id]
+  subnets = [
+    aws_subnet.example1.id,
+    aws_subnet.example2.id
+  ]
+
+  enable_deletion_protection = false
+}
+
+# Internal NLBから External ALB に通信をフォワードするListener
+resource "aws_lb_listener" "internal" {
+  load_balancer_arn = aws_lb.internal.arn
+  port              = 80
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_alb_target_group.internal_tg.arn
   }
 }
 
-data "aws_iam_policy" "lambda_policy" {
-  arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+resource "aws_alb_target_group" "internal_tg" {
+  name        = "${var.prefix}-internal-alb-tg"
+  target_type = "alb"
+  port        = 80
+  protocol    = "TCP"
+  vpc_id      = aws_vpc.example.id
 }
 
-resource "aws_iam_role" "lambda_role" {
-  name               = "${var.prefix}-lambda-role"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+resource "aws_lb_target_group_attachment" "internal_to_external" {
+  target_group_arn = aws_alb_target_group.internal_tg.arn
+  target_id        = aws_lb.external.arn
+  port             = 80
 }
 
-data "archive_file" "lambda_zip" {
-  type = "zip"
+resource "aws_security_group" "nlb-internal" {
+  name   = "${var.prefix}-nlb-internal-sg"
+  vpc_id = aws_vpc.example.id
 
-  source_dir  = "${path.cwd}/functions/"
-  output_path = "${path.cwd}/archives/lambda.zip"
-}
+  # 特定のIP アドレスからのアクセスのみを許可
+  ingress {
+    from_port = 80
+    to_port   = 80
+    protocol  = "tcp"
+    # API GW が紐づく VPC Link からのアクセスのみを許可
+    security_groups = [
+      aws_security_group.vpc_link.id
+    ]
+  }
 
-resource "aws_lambda_function" "hello_world" {
-  function_name = "${var.prefix}-lambda"
-  role          = aws_iam_role.lambda_role.arn
-  handler       = "sample.handler"
-  runtime       = "nodejs20.x"
-  filename      = data.archive_file.lambda_zip.output_path
+  egress {
+    from_port = 0
+    to_port   = 80
+    protocol  = "tcp"
+    cidr_blocks = [
+      aws_vpc.example.cidr_block
+    ]
+  }
 }
