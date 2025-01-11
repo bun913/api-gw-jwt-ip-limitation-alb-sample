@@ -1,6 +1,6 @@
 module.exports.handler = async (event) => {
   console.log("Event: ", event);
-  const responseMessage = "Congluts! Your can reach the function!";
+  const responseMessage = "Congrats! Your can reach the function!";
 
   return {
     statusCode: 200,
