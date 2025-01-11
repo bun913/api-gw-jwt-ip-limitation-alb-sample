@@ -3,8 +3,9 @@ output "base_url" {
   value       = aws_apigatewayv2_api.main.api_endpoint
 }
 
+// https://sample-jwt-auth-user-pool.auth.ap-northeast-1.amazoncognito.com/oauth2/token
 output "oauth_url" {
-  value       = "https://${aws_cognito_user_pool_domain.user_pool_domain.domain}/oauth2/token"
+  value       = "https://${aws_cognito_user_pool.user_pool.domain}.auth.${var.region}.amazoncognito.com/oauth2/token"
   description = "The OAuth URL of the Cognito User Pool"
 }
 
